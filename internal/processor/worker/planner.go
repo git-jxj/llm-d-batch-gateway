@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 )
 
 const modelMapFileName = "model_map.json"
@@ -38,10 +39,37 @@ type planRequestLine struct {
 		Model    string `json:"model"`
 		Stream   *bool  `json:"stream,omitempty"`
 		Messages []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
+			Role    string             `json:"role"`
+			Content planMessageContent `json:"content"`
 		} `json:"messages"`
 	} `json:"body"`
+}
+
+// planMessageContent extracts text only for prefix grouping. The original
+// content (including non-text parts) is read from the input file for forwarding.
+type planMessageContent string
+
+func (c *planMessageContent) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		*c = planMessageContent(text)
+		return nil
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(data, &parts); err != nil {
+		return err
+	}
+	var builder strings.Builder
+	for _, part := range parts {
+		if part.Type == "text" {
+			builder.WriteString(part.Text)
+		}
+	}
+	*c = planMessageContent(builder.String())
+	return nil
 }
 
 // NoPrefixHash is used when a request has no system prompt.
