@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -101,13 +102,43 @@ func checkContentError(t *testing.T, err error) {
 	}
 }
 
-func TestContentPartsRejectInvalidContent(t *testing.T) {
+func TestContentPartsRejectInvalidSystemContent(t *testing.T) {
 	for _, content := range []string{`42`, `true`, `{}`, `[42]`, `[{"type":"text","text":42}]`} {
 		t.Run(content, func(t *testing.T) {
-			line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[{"role":"user","content":` + content + `}]}}`)
+			line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[{"role":"system","content":` + content + `}]}}`)
 			if _, err := extractAndValidateLine(line); err == nil {
 				t.Fatal("accepted invalid message content")
 			}
 		})
+	}
+}
+
+func BenchmarkContentPreprocessing(b *testing.B) {
+	for _, tc := range []struct{ name, content string }{
+		{"string", `"` + strings.Repeat("user prompt ", 100) + `"`},
+		{"text_parts", `[` + strings.TrimSuffix(strings.Repeat(`{"type":"text","text":"user prompt "},`, 100), ",") + `]`},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[{"role":"system","content":"system prompt"},{"role":"user","content":` + tc.content + `}]}}`)
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := extractAndValidateLine(line); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestContentPartsSkipNonSystemDecoding(t *testing.T) {
+	// Metadata extraction leaves non-system content to the inference endpoint.
+	line := []byte(`{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"m","messages":[{"role":"user","content":{"future_content_type":true}},{"role":"system"},{"role":"system","content":null},{"role":"system","content":[]},{"role":"system","content":[{"type":"text","text":"hello"}]},{"role":"system","content":42}]}}`)
+	meta, err := extractAndValidateLine(line)
+	checkContentError(t, err)
+	h := fnv.New32a()
+	_, err = h.Write([]byte("hello"))
+	checkContentError(t, err)
+	if meta.PrefixHash != h.Sum32() {
+		t.Errorf("prefix hash = %d, want %d", meta.PrefixHash, h.Sum32())
 	}
 }

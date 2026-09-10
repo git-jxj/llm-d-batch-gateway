@@ -18,6 +18,7 @@ limitations under the License.
 package worker
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -39,37 +40,42 @@ type planRequestLine struct {
 		Model    string `json:"model"`
 		Stream   *bool  `json:"stream,omitempty"`
 		Messages []struct {
-			Role    string             `json:"role"`
-			Content planMessageContent `json:"content"`
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	} `json:"body"`
 }
 
-// planMessageContent extracts text only for prefix grouping. The original
-// content (including non-text parts) is read from the input file for forwarding.
-type planMessageContent string
-
-func (c *planMessageContent) UnmarshalJSON(data []byte) error {
-	var text string
-	if err := json.Unmarshal(data, &text); err == nil {
-		*c = planMessageContent(text)
-		return nil
+// messageText extracts only the system text needed for prefix grouping.
+// Other content stays encoded and the original input is used for forwarding.
+func messageText(content json.RawMessage) (string, error) {
+	content = bytes.TrimSpace(content)
+	if len(content) == 0 || bytes.Equal(content, []byte("null")) {
+		return "", nil
 	}
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(data, &parts); err != nil {
-		return err
-	}
-	var builder strings.Builder
-	for _, part := range parts {
-		if part.Type == "text" {
-			builder.WriteString(part.Text)
+	switch content[0] {
+	case '"':
+		var text string
+		err := json.Unmarshal(content, &text)
+		return text, err
+	case '[':
+		var parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
 		}
+		if err := json.Unmarshal(content, &parts); err != nil {
+			return "", err
+		}
+		var builder strings.Builder
+		for _, part := range parts {
+			if part.Type == "text" {
+				builder.WriteString(part.Text)
+			}
+		}
+		return builder.String(), nil
+	default:
+		return "", fmt.Errorf("must be a string or an array of content parts")
 	}
-	*c = planMessageContent(builder.String())
-	return nil
 }
 
 // NoPrefixHash is used when a request has no system prompt.
