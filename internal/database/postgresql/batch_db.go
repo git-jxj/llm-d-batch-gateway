@@ -33,15 +33,18 @@ var batchSchemaSql string
 
 // nonTerminalCondition is the SQL WHERE clause fragment that filters for
 // non-terminal batch statuses. Computed once since terminal statuses are fixed.
-var nonTerminalCondition = buildNonTerminalCondition()
+var nonTerminalCondition = buildNonTerminalCondition(colStatus)
 
-func buildNonTerminalCondition() string {
+// buildNonTerminalCondition builds the fragment against the given status
+// column reference, letting a caller qualify it (e.g. "b.status") when the
+// query joins another table that also has a status column.
+func buildNonTerminalCondition(column string) string {
 	statuses := openai.TerminalStatuses()
 	quoted := make([]string, len(statuses))
 	for i, s := range statuses {
 		quoted[i] = "'" + string(s) + "'"
 	}
-	return colStatus + `::jsonb->>'status' NOT IN (` + strings.Join(quoted, ",") + `)`
+	return column + `::jsonb->>'status' NOT IN (` + strings.Join(quoted, ",") + `)`
 }
 
 const (
@@ -49,6 +52,7 @@ const (
 	colPriority         = "priority"
 	colEpoch            = "epoch"
 	colRecoveryAttempts = "recovery_attempts"
+	colResumable        = "resumable"
 )
 
 // Compile-time checks.
@@ -63,7 +67,7 @@ type batchDescriptor struct{}
 func (batchDescriptor) TableName() string { return "batch_items" }
 func (batchDescriptor) Schema() string    { return batchSchemaSql }
 func (batchDescriptor) ExtraColumns() []string {
-	return []string{colProcessorID, colPriority, colEpoch, colRecoveryAttempts}
+	return []string{colProcessorID, colPriority, colEpoch, colRecoveryAttempts, colResumable}
 }
 
 // PostgresBatchDBClient implements api.BatchDBClient using PostgreSQL.
@@ -106,6 +110,7 @@ func (c *PostgresBatchDBClient) DBStore(ctx context.Context, item *api.BatchItem
 		colPriority:         item.Priority,
 		colEpoch:            item.Epoch,
 		colRecoveryAttempts: item.RecoveryAttempts,
+		colResumable:        item.Resumable,
 	}); err != nil {
 		return
 	}
@@ -145,6 +150,7 @@ func (c *PostgresBatchDBClient) DBGet(
 		priority, _ := extras[i][colPriority].(int64)
 		epoch, _ := extras[i][colEpoch].(int64)
 		recoveryAttempts, _ := extras[i][colRecoveryAttempts].(int64)
+		resumable, _ := extras[i][colResumable].(bool)
 		items[i] = &api.BatchItem{
 			BaseIndexes:      *indexes[i],
 			BaseContents:     *contents[i],
@@ -152,6 +158,7 @@ func (c *PostgresBatchDBClient) DBGet(
 			Priority:         priority,
 			Epoch:            epoch,
 			RecoveryAttempts: recoveryAttempts,
+			Resumable:        resumable,
 		}
 	}
 
@@ -163,15 +170,21 @@ func (c *PostgresBatchDBClient) DBUpdate(ctx context.Context, item *api.BatchIte
 		err = fmt.Errorf("item is nil")
 		return
 	}
-	var epochFence map[string]any
-	if item.Epoch > 0 {
-		epochFence = map[string]any{colEpoch: item.Epoch}
+	var updateConditions map[string]any
+	if item.Epoch > 0 || item.BumpEpoch {
+		updateConditions = map[string]any{colEpoch: item.Epoch}
 	}
 	var rawSets []string
 	if item.BumpEpoch {
 		rawSets = append(rawSets, colEpoch+" = "+colEpoch+" + 1")
 	}
-	if err = c.update(ctx, &item.BaseIndexes, &item.BaseContents, expectedStatus, epochFence, rawSets); err != nil {
+	if item.ExpectedResumable != nil {
+		if updateConditions == nil {
+			updateConditions = make(map[string]any)
+		}
+		updateConditions[colResumable] = *item.ExpectedResumable
+	}
+	if err = c.update(ctx, &item.BaseIndexes, &item.BaseContents, expectedStatus, updateConditions, rawSets); err != nil {
 		return
 	}
 	return
